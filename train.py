@@ -65,49 +65,38 @@ from spikingjelly.clock_driven import functional as sj_func
 
 
 
-######################################################
-import torch
 
-def compute_layer_weights(D_list, S_list):
+
+def load_teacher_model(teacher_path, device, num_classes, args):
     """
-    D_list: 每层动态剪枝扰动度
-    S_list: 每层spiking rate
+    从 checkpoint 加载 teacher 模型
     """
+    if not os.path.isfile(teacher_path):
+        raise FileNotFoundError(f"Teacher checkpoint not found: {teacher_path}")
 
-    D = torch.tensor(D_list, dtype=torch.float32)
-    S = torch.tensor(S_list, dtype=torch.float32)
+    # 按你当前训练用的模型结构创建 teacher
+    if args.dataset == 'dvscifar10':
+        teacher = SNNDVS5Conv(num_classes=10, in_channels=2)
+    else:
+        teacher = snnvgg16_bn(num_classes=num_classes)
 
-    # 归一化
-    D_hat = (D - D.min()) / (D.max() - D.min() + 1e-6)
-    S_hat = (S - S.min()) / (S.max() - S.min() + 1e-6)
+    checkpoint = torch.load(teacher_path, map_location=device)
 
-    # 深度权重
-    L = len(D_list)
-    H = torch.arange(1, L+1).float() / L
-    H_hat = H ** 2  # 强调深层
+    if 'state_dict' in checkpoint:
+        state_dict = checkpoint['state_dict']
+    else:
+        state_dict = checkpoint
 
-    # 增强版权重
-    weights = (0.7 * D_hat + 0.3 * S_hat) * (1 + 0.5 * H_hat)
+    teacher.load_state_dict(state_dict, strict=True)
+    teacher = teacher.to(device)
+    teacher.eval()
 
-    return weights.tolist()
+    for p in teacher.parameters():
+        p.requires_grad_(False)
 
-
-def select_topk_layers(weights, k=3):
-    weights = torch.tensor(weights)
-    topk = torch.topk(weights, k)
-    return topk.indices.tolist()
+    return teacher
 
 
-class FeatureHook:
-    def __init__(self, module):
-        self.feature = None
-        self.hook = module.register_forward_hook(self.save)
-
-    def save(self, module, input, output):
-        self.feature = output
-
-    def close(self):
-        self.hook.remove()
 
 
 
@@ -156,30 +145,23 @@ def load_cfg_channels(cfg_path):
 
 
 
-def collect_layer_spike_rates(manager):
+
+
+
+
+@torch.no_grad()
+
+
+def compute_vgg_synops(cfg_channels, spike_rates, T=4, input_size=32, num_classes=100):
     """
-    从 PruningLayer 中取每层平均 spike rate
-    返回长度 = conv层数 的列表
-    """
-    spike_rates = []
+    按压缩后模型计算 SynOps
+    只统计:
+    - 13个卷积层
+    - 3个全连接层(classifier1, classifier2, fc)
 
-    for pl in manager.pruning_layers:
-        sr = pl.get_spike_rate()
-        if sr is None:
-            spike_rates.append(1.0)
-        else:
-            spike_rates.append(float(sr.mean().item()))
-
-    return spike_rates
-
-
-def compute_vgg_synops(cfg_channels, spike_rates, T=4, input_size=32):
-    """
-    对 snnvgg16_bn 做近似 SynOps 计算:
-    SynOps = DenseOps * spike_rate
-
-    spatial_sizes 对 CIFAR 默认是:
-    [32, 32, 16, 16, 8, 8, 8, 4, 4, 4, 2, 2, 2]
+    关键改动:
+    每一层卷积的 SynOps 使用“输入到该层的 spike rate”
+    而不是当前层输出 spike rate
     """
     assert len(cfg_channels) == 13, f"Expected 13 conv layers, got {len(cfg_channels)}"
     assert len(spike_rates) == 13, f"Expected 13 spike rates, got {len(spike_rates)}"
@@ -194,12 +176,35 @@ def compute_vgg_synops(cfg_channels, spike_rates, T=4, input_size=32):
     total_synops = 0.0
     in_channels = 3
 
+    # conv1 输入是图像，输入率设为 1.0
+    # conv2 用第1层输出spike rate
+    # conv3 用第2层输出spike rate
+    # ...
+    input_spike_rates = [1.0] + list(spike_rates[:-1])
+
+    # 13个卷积层
     for i, out_channels in enumerate(cfg_channels):
         H = W = spatial_sizes[i]
-        dense_ops = T * H * W * out_channels * in_channels * 3 * 3
-        synops = dense_ops * spike_rates[i]
+        r_in = input_spike_rates[i]
+        synops = T * H * W * out_channels * in_channels * 3 * 3 * r_in
         total_synops += synops
         in_channels = out_channels
+
+    # FC部分
+    last_c = cfg_channels[-1]
+
+    # classifier1: last_c -> 512
+    r_fc1_in = spike_rates[-1]
+    total_synops += T * last_c * 512 * r_fc1_in
+
+    # classifier2: 512 -> 512
+    # 这里先近似使用最后一层卷积输出的 spike rate
+    r_fc2_in = spike_rates[-1]
+    total_synops += T * 512 * 512 * r_fc2_in
+
+    # fc: 512 -> num_classes
+    r_fc3_in = spike_rates[-1]
+    total_synops += T * 512 * num_classes * r_fc3_in
 
     return total_synops
 
@@ -207,37 +212,43 @@ def compute_vgg_synops(cfg_channels, spike_rates, T=4, input_size=32):
 
 
 
+
+
+
 def compute_compact_vgg_params(cfg_channels, num_classes=100):
     """
-    按 snnvgg16_bn 的 13 个卷积层近似计算 compact model 参数量
-    包含:
-    - conv
-    - bn(weight+bias)
-    - 两层 classifier 的近似参数
+    计算压缩后 VGG16 SNN 的参数量
+    只统计:
+    - 所有 Conv 层
+    - 所有 FC 层
+    不统计 BN
+    与论文 Params = sum(Params_conv) + sum(Params_fc) 一致
     """
-    assert len(cfg_channels) == 13, f"Expected 13 conv layers, got {len(cfg_channels)}"
+
+    assert len(cfg_channels) == 13, f"Expected 13 conv channels, got {len(cfg_channels)}"
 
     total_params = 0
     in_channels = 3
 
-    # conv + bn
+    # 13个卷积层参数
     for out_channels in cfg_channels:
-        # conv weight
         total_params += out_channels * in_channels * 3 * 3
-        # bn weight + bias
-        total_params += 2 * out_channels
         in_channels = out_channels
 
-    # 下面这部分按你 snnvgg16_bn 的 classifier 近似
-    # 你的 remove_pruned_channels.py 里明显是两层线性层风格
+    # 分类头参数
     last_c = cfg_channels[-1]
 
-    # classifier1: last_c -> 512
-    total_params += last_c * 512 + 512
-    # classifier2 / fc: 512 -> num_classes
+    # classifier1: Linear(last_c -> 512, bias=False)
+    total_params += last_c * 512
+
+    # classifier2: Linear(512 -> 512, bias=False)
+    total_params += 512 * 512
+
+    # fc: Linear(512 -> num_classes, bias=True)
     total_params += 512 * num_classes + num_classes
 
     return total_params
+
 
 '''
 from thop import profile
@@ -263,20 +274,6 @@ def _gap_time(feat: torch.Tensor):
     return feat
 
 
-def _infer_ptp_hook_layers(model, num_layers=2):
-    """
-    自动选择最后 num_layers 个 Conv2d 层名
-    这样 VGG / ResNet / 5Conv+1FC 都能复用
-    """
-    conv_names = []
-    for name, module in model.named_modules():
-        if isinstance(module, nn.Conv2d):
-            conv_names.append(name)
-
-    if len(conv_names) < num_layers:
-        raise ValueError(f'Not enough Conv2d layers to infer {num_layers} hook layers.')
-
-    return tuple(conv_names[-num_layers:])
 
 
 def _register_feature_hooks(model, layer_names):
@@ -306,22 +303,6 @@ def _register_feature_hooks(model, layer_names):
     return features, handles
 
 
-def _pruned_channel_l2(model, pruned_out_idx_list):
-    """
-    只对将被剪掉的 out-channels 做 L2 惩罚
-    """
-    convs = [m for m in model.modules() if isinstance(m, nn.Conv2d)]
-    loss_reg = 0.0
-
-    for i, conv in enumerate(convs):
-        if i >= len(pruned_out_idx_list):
-            break
-        idx = pruned_out_idx_list[i]
-        if idx.numel() > 0:
-            w = conv.weight[idx]  # [Cp, Cin, k, k]
-            loss_reg = loss_reg + 0.5 * w.pow(2).sum()
-
-    return loss_reg
 
 
 def _normalize_list(vals):
@@ -364,190 +345,7 @@ def get_last_conv_names(model, num_layers=4):
 
 
 
-def ptp_information_aggregation(model, teacher, calib_loader, device,
-                               pruned_out_idx_list,
-                               hook_layers=None,
-                               iters=10, reg=0.02, inc=0.02, lr=1e-3,
-                               use_amp=False):
-    """
-    Stage-1: 剪前信息聚合（IA）
-    1) feature reconstruction
-    2) 对将剪掉通道施加递增L2惩罚
-    """
-    model.train()
-    teacher.eval()
 
-    if hook_layers is None:
-        hook_layers = _infer_ptp_hook_layers(model, num_layers=2)
-    print('IA hook layers:', hook_layers)
-
-    s_feats, s_handles = _register_feature_hooks(model, hook_layers)
-    t_feats, t_handles = _register_feature_hooks(teacher, hook_layers)
-
-    opt = torch.optim.Adam(model.parameters(), lr=lr)
-
-    step = 0
-    for (x, y) in calib_loader:
-        x = x.to(device).float()
-
-        # teacher forward
-        with torch.no_grad():
-            _ = teacher(x)
-            t_feature_list = []
-            for name in hook_layers:
-                t_feature_list.append(_gap_time(t_feats[name]).detach())
-            sj_func.reset_net(teacher)
-
-        # student forward
-        if use_amp:
-            with amp.autocast():
-                _ = model(x)
-                s_feature_list = []
-                for name in hook_layers:
-                    s_feature_list.append(_gap_time(s_feats[name]))
-                sj_func.reset_net(model)
-
-                loss_feat = 0.0
-                for sf, tf in zip(s_feature_list, t_feature_list):
-                    loss_feat = loss_feat + F.mse_loss(sf, tf)
-
-                lam = reg + step * inc
-                loss_reg = _pruned_channel_l2(model, pruned_out_idx_list)
-
-                loss = loss_feat + lam * loss_reg
-        else:
-            _ = model(x)
-            s_feature_list = []
-            for name in hook_layers:
-                s_feature_list.append(_gap_time(s_feats[name]))
-            sj_func.reset_net(model)
-
-            loss_feat = 0.0
-            for sf, tf in zip(s_feature_list, t_feature_list):
-                loss_feat = loss_feat + F.mse_loss(sf, tf)
-
-            lam = reg + step * inc
-            loss_reg = _pruned_channel_l2(model, pruned_out_idx_list)
-
-            loss = loss_feat + lam * loss_reg
-
-        opt.zero_grad(set_to_none=True)
-        loss.backward()
-        opt.step()
-
-        step += 1
-        if step >= iters:
-            break
-
-    for h in s_handles + t_handles:
-        h.remove()
-
-
-def ptp_reconstruction(model, teacher, calib_loader, device,
-                       criterion,
-                       hook_layers=None,
-                       iters=10, lr=1e-3, use_amp=False):
-    """
-    Stage-2: 剪后整体重建（REC）
-    1) 多层 feature reconstruction
-    2) 加少量 CE，防止只贴 teacher 而偏离标签
-    3) layer-wise lr balance
-    """
-    model.train()
-
-    for m in model.modules():
-        if isinstance(m, nn.BatchNorm2d):
-            m.eval()  # 冻结 BN 统计量
-    teacher.eval()
-
-    if hook_layers is None:
-        hook_layers = _infer_ptp_hook_layers(model, num_layers=2)
-    print('REC hook layers:', hook_layers)
-
-    s_feats, s_handles = _register_feature_hooks(model, hook_layers)
-    t_feats, t_handles = _register_feature_hooks(teacher, hook_layers)
-
-    # layer-wise lr balance
-    name_to_module = dict(model.named_modules())
-    param_groups = []
-    L = len(hook_layers)
-
-    for j, name in enumerate(hook_layers, start=1):
-        layer_lr = lr / (L - j + 1)
-        params = list(name_to_module[name].parameters())
-        if len(params) > 0:
-            param_groups.append({
-                "params": params,
-                "lr": layer_lr
-            })
-
-    # classifier / fc 给 base lr
-    for key in ['classifier1', 'classifier2', 'fc']:
-        if key in name_to_module:
-            params = list(name_to_module[key].parameters())
-            if len(params) > 0:
-                param_groups.append({
-                    "params": params,
-                    "lr": lr
-                })
-
-    if len(param_groups) == 0:
-        opt = torch.optim.Adam(model.parameters(), lr=lr)
-    else:
-        opt = torch.optim.Adam(param_groups)
-
-    step = 0
-    for (x, y) in calib_loader:
-        x = x.to(device).float()
-        y = y.to(device)
-
-        # teacher
-        with torch.no_grad():
-            _ = teacher(x)
-            t_feature_list = []
-            for name in hook_layers:
-                t_feature_list.append(_gap_time(t_feats[name]).detach())
-            sj_func.reset_net(teacher)
-
-        # student
-        if use_amp:
-            with amp.autocast():
-                s_logits = model(x)
-                s_feature_list = []
-                for name in hook_layers:
-                    s_feature_list.append(_gap_time(s_feats[name]))
-                sj_func.reset_net(model)
-
-                loss_feat = 0.0
-                for sf, tf in zip(s_feature_list, t_feature_list):
-                    loss_feat = loss_feat + F.mse_loss(sf, tf)
-
-                loss_ce = criterion(s_logits, y)
-                loss = loss_feat + 0.1 * loss_ce
-        else:
-            s_logits = model(x)
-            s_feature_list = []
-            for name in hook_layers:
-                s_feature_list.append(_gap_time(s_feats[name]))
-            sj_func.reset_net(model)
-
-            loss_feat = 0.0
-            for sf, tf in zip(s_feature_list, t_feature_list):
-                loss_feat = loss_feat + F.mse_loss(sf, tf)
-
-            loss_ce = criterion(s_logits, y)
-            loss = loss_feat + 0.1 * loss_ce
-
-        opt.zero_grad(set_to_none=True)
-        loss.backward()
-        opt.step()
-
-        step += 1
-        if step >= iters:
-            break
-
-    for h in s_handles + t_handles:
-        h.remove()
 
 
 
@@ -608,6 +406,7 @@ def adaptive_final_reconstruction(model, teacher, manager, calib_loader, device,
 
         with torch.no_grad():
             _ = teacher(x)
+            sj_func.reset_net(teacher)
             t_feature_dict = {}
             for name in selected_layers:
                 t_feature_dict[name] = _gap_time(t_feats[name]).detach()
@@ -669,89 +468,7 @@ def l1_regularization(model, l1_alpha):
         
             module.weight.grad.data.add_(l1_alpha * torch.sign(module.weight.data))
 
-'''
-def train_one_epoch(model,manager, criterion, optimizer, data_loader, device, epoch, print_freq, scaler=None, accum_steps=1):
-    model.train()
-    metric_logger = utils.MetricLogger(delimiter="  ")
-    metric_logger.add_meter('lr', utils.SmoothedValue(window_size=1, fmt='{value}'))
-    metric_logger.add_meter('img/s', utils.SmoothedValue(window_size=10, fmt='{value}'))
 
-    header = 'Epoch: [{}]'.format(epoch)
-
-    accum_steps = max(1, int(accum_steps))
-
-    optimizer.zero_grad(set_to_none=True)
-
-    for image, target in tqdm(data_loader):
-
-        
-
-        start_time = time.time()
-        image, target = image.to(device).float(), target.to(device)
-        # with torch.autograd.detect_anomaly():
-        if scaler is not None:
-            with amp.autocast():
-                output = model(image)
-                loss = criterion(output, target)
-        else:
-
-            output = model(image)
-            loss = criterion(output, target)
-
-        loss_to_backprop = loss / accum_steps
-        
-
-        
-
-        if scaler is not None:
-            scaler.scale(loss).backward()
-            
-            scaler.step(optimizer)
-            scaler.update()
-
-        else:
-            loss.backward()
-            
-            
-            l1_regularization(model, l1_lambda)
-            optimizer.step()
-            
-    
-      
-       
-        
-    
-        
-        
-
-        functional.reset_net(model)
-        
-      
-
-        acc1, acc5 = utils.accuracy(output, target, topk=(1, 5))
-        #print(acc1)
-        batch_size = image.shape[0]
-        loss_s = loss.item()
-        if math.isnan(loss_s):
-            raise ValueError('loss is Nan')
-        acc1_s = acc1.item()
-        acc5_s = acc5.item()
-
-        metric_logger.update(loss=loss_s, lr=optimizer.param_groups[0]["lr"])
-
-        metric_logger.meters['acc1'].update(acc1_s, n=batch_size)
-        metric_logger.meters['acc5'].update(acc5_s, n=batch_size)
-        metric_logger.meters['img/s'].update(batch_size / (time.time() - start_time))
-
-    
- 
-
-    # gather the stats from all processes
-    metric_logger.synchronize_between_processes()
-    print(acc1_s)
-    return metric_logger.loss.global_avg, metric_logger.acc1.global_avg, metric_logger.acc5.global_avg
-
-'''
 def train_one_epoch(model, manager, criterion, optimizer, data_loader, device, epoch, print_freq,
                     scaler=None, accum_steps=1):
 
@@ -1148,52 +865,16 @@ def main(args):
 
         test_loss, test_acc1, test_acc5 = evaluate(model, criterion, test_loader, device=device, header='Test:')
         if epoch >= args.prune_warmup and ((epoch - args.prune_warmup) % args.prune_interval == 0):
-            # if args.ptp:
-            #     # teacher = 当前模型的冻结拷贝（剪枝前）
-            #     teacher = copy.deepcopy(model).to(device)
-            #     teacher.eval()
-            #     for p in teacher.parameters():
-            #         p.requires_grad_(False)
+
 
             # 先更新 mask（决定“将剪哪些通道”）
             mymanager.update_masks(model, args.alpha, args.beta)
 
-            # if args.ptp:
-            #     # 拿到将被剪掉的通道索引（与 do_masks 的 conv 顺序一致）
-            #     pruned_out_idx_list = mymanager.get_pruned_out_idx_list(device=device)
-            #
-            #     # calib 数据：只取 train_loader 的前 N 个 batch
-            #     calib_iter = _make_calib_iter(train_loader, args.ptp_calib_batches)
-            #
-            #     # Stage-1：剪前信息聚合（IA）
-            #
-            #     ptp_information_aggregation(
-            #         model, teacher, calib_iter, device,
-            #         pruned_out_idx_list=pruned_out_idx_list,
-            #         hook_layers=None,
-            #         iters=args.ptp_ia_iters,
-            #         reg=args.ptp_reg,
-            #         inc=args.ptp_inc,
-            #         lr=args.ptp_lr,
-            #         use_amp=args.amp
-            #     )
+
 
             # 真正让 mask 生效（剪权重）
             mymanager.do_masks(model)
 
-            # if args.ptp:
-            #     calib_iter = _make_calib_iter(train_loader, args.ptp_calib_batches)
-            #
-            #     # Stage-2：剪后整体重建（REC）
-            #
-            #     ptp_reconstruction(
-            #         model, teacher, calib_iter, device,
-            #         criterion=criterion,
-            #         hook_layers=None,
-            #         iters=args.ptp_rec_iters,
-            #         lr=args.ptp_lr,
-            #         use_amp=args.amp
-            #     )
 
             '''
             mymanager.update_masks(model,args.alpha,args.beta) #alpha is the 1-(p+q) in the paper, beta id the q in the paper
@@ -1247,10 +928,22 @@ def main(args):
     if args.adaptive_rec and len(mymanager.masks) > 0:
         print('\n===== Start adaptive final reconstruction =====')
 
-        teacher = copy.deepcopy(model).to(device)
-        teacher.eval()
-        for p in teacher.parameters():
-            p.requires_grad_(False)
+
+
+        if args.teacher_path != '':
+            print(f"[Info] Loading teacher from: {args.teacher_path}")
+            teacher = load_teacher_model(
+                teacher_path=args.teacher_path,
+                device=device,
+                num_classes=num_classes,
+                args=args
+            )
+        else:
+            print("[Info] No teacher_path provided, fallback to current model snapshot.")
+            teacher = copy.deepcopy(model).to(device)
+            teacher.eval()
+            for p in teacher.parameters():
+                p.requires_grad_(False)
 
         calib_iter = _make_calib_iter(train_loader, args.ptp_calib_batches)
 
@@ -1275,7 +968,7 @@ def main(args):
         )
         print('After adaptive reconstruction:', final_test_acc1, final_test_acc5)
 
-    if args.adaptive_rec:
+    if args.adaptive_rec and len(mymanager.masks) > 0:
         adaptive_save_path = os.path.join(args.output_dir, 'adaptive_rec_final.pth.tar')
         torch.save({
             'state_dict': model.state_dict(),
@@ -1291,12 +984,18 @@ def main(args):
     mymanager.save_final_mask()
     mymanager.save_cfg()
 
-    # ===== 1) Connection =====
+
+
+    # ===== 1) Connection (保留你的原统计，方便参考) =====
     nonzero_w, total_w, conn_percent = compute_connection_percent(model)
 
-    # ===== 2) Parameters (compact model, from cfg.txt) =====
+    # ===== 2) 读取压缩后 cfg =====
     cfg_path = os.path.join(args.output_dir, "cfg.txt")
     cfg_channels = load_cfg_channels(cfg_path)
+
+    print("cfg_channels:", cfg_channels)
+    print("len(cfg_channels):", len(cfg_channels))
+    print("cfg_channels:", cfg_channels)
 
     if args.dataset == 'cifar10':
         num_classes_for_stats = 10
@@ -1312,48 +1011,60 @@ def main(args):
         num_classes_for_stats = num_classes
         input_size_for_stats = 32
 
-    orig_cfg = [64, 64, 128, 128, 256, 256, 256, 512, 512, 512, 512, 512, 512]
-    orig_params = compute_compact_vgg_params(orig_cfg, num_classes=num_classes_for_stats)
-    compact_params = compute_compact_vgg_params(cfg_channels, num_classes=num_classes_for_stats)
-    param_percent = 100.0 * compact_params / orig_params
+    # ===== 3) 压缩后参数量 =====
+    compact_params = compute_compact_vgg_params(
+        cfg_channels,
+        num_classes=num_classes_for_stats
+    )
 
-    # ===== 3) SynOps (approx.) =====
-    spike_rates = collect_layer_spike_rates(mymanager)
+    # ===== 4) 压缩后 spike rate =====
+    spike_rates = calibrate_spike_rates(
+        model=model,
+        manager=mymanager,
+        data_loader=test_loader,
+        device=device,
+        num_batches=10
+    )
 
-    # 如果 spike_rates 数量和 cfg_channels 不一致，先截断到一致
-    n = min(len(spike_rates), len(cfg_channels))
+    # 这里要求和13层卷积对齐
+    if len(spike_rates) != 13:
+        print(f"[Warning] spike_rates length = {len(spike_rates)}, cfg_channels length = {len(cfg_channels)}")
+
+    n = min(len(spike_rates), len(cfg_channels), 13)
     spike_rates = spike_rates[:n]
     cfg_channels_for_syn = cfg_channels[:n]
-    orig_cfg_for_syn = orig_cfg[:n]
 
-    synops_orig = compute_vgg_synops(
-        orig_cfg_for_syn,
-        spike_rates,
-        T=args.T,
-        input_size=input_size_for_stats
-    )
-    synops_compact = compute_vgg_synops(
-        cfg_channels_for_syn,
-        spike_rates,
-        T=args.T,
-        input_size=input_size_for_stats
-    )
-    synops_percent = 100.0 * synops_compact / synops_orig
+    # 只有在长度足够时才计算 SynOps
+    if n == 13:
+        compact_synops = compute_vgg_synops(
+            cfg_channels_for_syn,
+            spike_rates,
+            T=args.T,
+            input_size=input_size_for_stats,
+            num_classes=num_classes_for_stats
+        )
+    else:
+        compact_synops = -1
+        print("[Warning] Cannot compute compact_synops exactly because n != 13")
 
     print("============== Final Compression Statistics ==============")
-    print(f"Connection (%): {conn_percent:.2f}")
-    print(f"Parameters (%): {param_percent:.2f}")
-    print(f"SynOps (%):     {synops_percent:.2f}")
+    print(f"Connection (%):    {conn_percent:.2f}")
+    print(f"Compact Params:    {compact_params / 1e6:.4f} M")
+
+    if compact_synops >= 0:
+        print(f"Compact SynOps:    {compact_synops / 1e3:.4f} K")
+    else:
+        print("Compact SynOps:    unavailable")
 
     stats = {
         "connection_percent": conn_percent,
-        "parameters_percent": param_percent,
-        "synops_percent": synops_percent,
         "nonzero_weights": nonzero_w,
         "total_weights": total_w,
         "compact_params": compact_params,
-        "orig_params": orig_params
+        "compact_synops": compact_synops
     }
+
+
 
     df = pd.DataFrame([stats])
     df.to_csv(os.path.join(args.output_dir, "model_stats.csv"), index=False)
@@ -1466,6 +1177,9 @@ def parse_args():
     parser.add_argument('--adaptive-rec-iters', default=20, type=int)
     parser.add_argument('--adaptive-rec-topk', default=3, type=int)
     parser.add_argument('--adaptive-rec-lambda', default=1.0, type=float)
+    parser.add_argument('--teacher_path', default='', type=str, help='path to teacher checkpoint')
+
+
 
 
     args = parser.parse_args()
