@@ -193,7 +193,7 @@ class VGG(nn.Module):
         self.prune13 = PruningLayer(layer_id=12)
         self.pool5=layer.SeqToANNContainer(nn.MaxPool2d(kernel_size=2, stride=2))
 
-
+        self.gap = layer.SeqToANNContainer(nn.AdaptiveAvgPool2d((1, 1)))
 
 
 
@@ -227,9 +227,15 @@ class VGG(nn.Module):
                 m.weight.data.normal_(0, 0.02)
 
     def forward(self, x):
-
-        x.unsqueeze_(0)
+        '''
+        x = x.unsqueeze(0)
         out = x.repeat(4, 1, 1, 1, 1)
+        '''
+        if x.dim() == 4:
+            x = x.unsqueeze(0)
+            out = x.repeat(4, 1, 1, 1, 1)
+        else:
+            out = x
         
         
 
@@ -295,6 +301,7 @@ class VGG(nn.Module):
         out = self.prune13(out, v13)
         out = self.pool5(out)
 
+        out = self.gap(out)
 
         # print(out.shape)
         ##out = self.features(out)

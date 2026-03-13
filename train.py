@@ -1,10 +1,13 @@
 import datetime
 import os
 import time
+
+import pandas as pd
 import torch
 import torch.utils.data
 from torch import nn
 import torchvision
+from torch.utils.data import random_split
 from torchvision import transforms
 #from torch.utils.tensorboard import SummaryWriter
 import math
@@ -16,7 +19,9 @@ from spikingjelly.clock_driven import functional
 import utils
 from tqdm import tqdm
 from spikingjelly.clock_driven import neuron, encoding, functional
-from torch.optim.lr_scheduler import StepLR
+from torch.optim.lr_scheduler import StepLR, MultiStepLR
+
+from torch.optim.lr_scheduler import CosineAnnealingLR
 _seed_ = 2020
 import random
 import torch.optim as optim
@@ -32,7 +37,8 @@ writer = SummaryWriter('./')
 random.seed(2020)
 
 
-from spikingjelly.datasets.dvs_cifar10 import DVS_CIFAR10
+
+from spikingjelly.datasets.cifar10_dvs import CIFAR10DVS
 
 torch.manual_seed(_seed_)  # use torch.manual_seed() to seed the RNG for all devices (both CPU and CUDA)
 torch.cuda.manual_seed_all(_seed_)
@@ -41,16 +47,615 @@ torch.backends.cudnn.benchmark = False
 
 import numpy as np
 
+writer = SummaryWriter('./')
+
+
 from mask_manage import PruningLayer, PruningNetworkManager
 np.random.seed(_seed_)
 
 import numpy as np
+from snndvs import SNNDVS5Conv
 
 np.random.seed(_seed_)
-writer = SummaryWriter('./')
+
+
+import copy
+import torch.nn.functional as F
+from spikingjelly.clock_driven import functional as sj_func
 
 
 
+######################################################
+import torch
+
+def compute_layer_weights(D_list, S_list):
+    """
+    D_list: 每层动态剪枝扰动度
+    S_list: 每层spiking rate
+    """
+
+    D = torch.tensor(D_list, dtype=torch.float32)
+    S = torch.tensor(S_list, dtype=torch.float32)
+
+    # 归一化
+    D_hat = (D - D.min()) / (D.max() - D.min() + 1e-6)
+    S_hat = (S - S.min()) / (S.max() - S.min() + 1e-6)
+
+    # 深度权重
+    L = len(D_list)
+    H = torch.arange(1, L+1).float() / L
+    H_hat = H ** 2  # 强调深层
+
+    # 增强版权重
+    weights = (0.7 * D_hat + 0.3 * S_hat) * (1 + 0.5 * H_hat)
+
+    return weights.tolist()
+
+
+def select_topk_layers(weights, k=3):
+    weights = torch.tensor(weights)
+    topk = torch.topk(weights, k)
+    return topk.indices.tolist()
+
+
+class FeatureHook:
+    def __init__(self, module):
+        self.feature = None
+        self.hook = module.register_forward_hook(self.save)
+
+    def save(self, module, input, output):
+        self.feature = output
+
+    def close(self):
+        self.hook.remove()
+
+
+
+
+
+
+
+
+
+
+
+
+
+def _make_calib_iter(data_loader, num_batches):
+    """只取前 num_batches 个 batch 用来校准/重建，避免太耗时"""
+    for i, batch in enumerate(data_loader):
+        if i >= num_batches:
+            break
+        yield batch
+
+def count_parameters(model):
+    return sum(p.numel() for p in model.parameters() if p.requires_grad)
+
+
+def compute_connection_percent(model):
+    total_weights = 0
+    nonzero_weights = 0
+
+    for m in model.modules():
+        if isinstance(m, (nn.Conv2d, nn.Linear)):
+            w = m.weight.data
+            total_weights += w.numel()
+            nonzero_weights += (w != 0).sum().item()
+
+    percent = 100.0 * nonzero_weights / total_weights
+    return nonzero_weights, total_weights, percent
+
+
+
+def load_cfg_channels(cfg_path):
+    with open(cfg_path, "r") as f:
+        text = f.read().strip()
+    # cfg.txt 形如: [52, 60, 110, ...]
+    cfg_channels = eval(text)
+    return cfg_channels
+
+
+
+def collect_layer_spike_rates(manager):
+    """
+    从 PruningLayer 中取每层平均 spike rate
+    返回长度 = conv层数 的列表
+    """
+    spike_rates = []
+
+    for pl in manager.pruning_layers:
+        sr = pl.get_spike_rate()
+        if sr is None:
+            spike_rates.append(1.0)
+        else:
+            spike_rates.append(float(sr.mean().item()))
+
+    return spike_rates
+
+
+def compute_vgg_synops(cfg_channels, spike_rates, T=4, input_size=32):
+    """
+    对 snnvgg16_bn 做近似 SynOps 计算:
+    SynOps = DenseOps * spike_rate
+
+    spatial_sizes 对 CIFAR 默认是:
+    [32, 32, 16, 16, 8, 8, 8, 4, 4, 4, 2, 2, 2]
+    """
+    assert len(cfg_channels) == 13, f"Expected 13 conv layers, got {len(cfg_channels)}"
+    assert len(spike_rates) == 13, f"Expected 13 spike rates, got {len(spike_rates)}"
+
+    if input_size == 32:
+        spatial_sizes = [32, 32, 16, 16, 8, 8, 8, 4, 4, 4, 2, 2, 2]
+    elif input_size == 64:
+        spatial_sizes = [64, 64, 32, 32, 16, 16, 16, 8, 8, 8, 4, 4, 4]
+    else:
+        raise ValueError(f"Unsupported input_size: {input_size}")
+
+    total_synops = 0.0
+    in_channels = 3
+
+    for i, out_channels in enumerate(cfg_channels):
+        H = W = spatial_sizes[i]
+        dense_ops = T * H * W * out_channels * in_channels * 3 * 3
+        synops = dense_ops * spike_rates[i]
+        total_synops += synops
+        in_channels = out_channels
+
+    return total_synops
+
+
+
+
+
+def compute_compact_vgg_params(cfg_channels, num_classes=100):
+    """
+    按 snnvgg16_bn 的 13 个卷积层近似计算 compact model 参数量
+    包含:
+    - conv
+    - bn(weight+bias)
+    - 两层 classifier 的近似参数
+    """
+    assert len(cfg_channels) == 13, f"Expected 13 conv layers, got {len(cfg_channels)}"
+
+    total_params = 0
+    in_channels = 3
+
+    # conv + bn
+    for out_channels in cfg_channels:
+        # conv weight
+        total_params += out_channels * in_channels * 3 * 3
+        # bn weight + bias
+        total_params += 2 * out_channels
+        in_channels = out_channels
+
+    # 下面这部分按你 snnvgg16_bn 的 classifier 近似
+    # 你的 remove_pruned_channels.py 里明显是两层线性层风格
+    last_c = cfg_channels[-1]
+
+    # classifier1: last_c -> 512
+    total_params += last_c * 512 + 512
+    # classifier2 / fc: 512 -> num_classes
+    total_params += 512 * num_classes + num_classes
+
+    return total_params
+
+'''
+from thop import profile
+
+def compute_macs(model, input_shape=(1,3,32,32), device='cuda'):
+    model.eval()
+    dummy = torch.randn(input_shape).to(device)
+    macs, params = profile(model, inputs=(dummy,), verbose=False)
+    return macs
+'''
+
+
+
+def _gap_time(feat: torch.Tensor):
+    """
+    SNN feature: [T, B, C, H, W] -> [B, C]
+    ANN feature: [B, C, H, W] -> [B, C]
+    """
+    if feat.dim() == 5:
+        feat = feat.mean(dim=0)       # [B, C, H, W]
+    if feat.dim() == 4:
+        feat = feat.mean(dim=(2, 3))  # GAP -> [B, C]
+    return feat
+
+
+def _infer_ptp_hook_layers(model, num_layers=2):
+    """
+    自动选择最后 num_layers 个 Conv2d 层名
+    这样 VGG / ResNet / 5Conv+1FC 都能复用
+    """
+    conv_names = []
+    for name, module in model.named_modules():
+        if isinstance(module, nn.Conv2d):
+            conv_names.append(name)
+
+    if len(conv_names) < num_layers:
+        raise ValueError(f'Not enough Conv2d layers to infer {num_layers} hook layers.')
+
+    return tuple(conv_names[-num_layers:])
+
+
+def _register_feature_hooks(model, layer_names):
+    """
+    layer_names: 例如 ('layer12', 'layer13')
+    返回:
+        features: dict
+        handles: list
+    """
+    features = {}
+    handles = []
+
+    name_to_module = dict(model.named_modules())
+
+    for name in layer_names:
+        if name not in name_to_module:
+            raise ValueError(f'Hook layer "{name}" not found in model.named_modules().')
+
+        def _make_hook(key):
+            def hook(module, inp, out):
+                features[key] = out
+            return hook
+
+        h = name_to_module[name].register_forward_hook(_make_hook(name))
+        handles.append(h)
+
+    return features, handles
+
+
+def _pruned_channel_l2(model, pruned_out_idx_list):
+    """
+    只对将被剪掉的 out-channels 做 L2 惩罚
+    """
+    convs = [m for m in model.modules() if isinstance(m, nn.Conv2d)]
+    loss_reg = 0.0
+
+    for i, conv in enumerate(convs):
+        if i >= len(pruned_out_idx_list):
+            break
+        idx = pruned_out_idx_list[i]
+        if idx.numel() > 0:
+            w = conv.weight[idx]  # [Cp, Cin, k, k]
+            loss_reg = loss_reg + 0.5 * w.pow(2).sum()
+
+    return loss_reg
+
+
+def _normalize_list(vals):
+    vals = torch.tensor(vals, dtype=torch.float32)
+    if vals.numel() == 0:
+        return vals
+    vmin = vals.min()
+    vmax = vals.max()
+    if float(vmax - vmin) < 1e-12:
+        return torch.zeros_like(vals)
+    return (vals - vmin) / (vmax - vmin + 1e-6)
+
+
+def compute_adaptive_layer_weights(manager):
+    """
+    增强版:
+    w_l = (0.7 * D_hat + 0.3 * S_hat) * (1 + 0.5 * H_hat)
+    """
+    D_list = manager.get_avg_change_ratios()
+    S_list = manager.get_avg_spike_rates()
+    H_list = manager.get_depth_priors()
+
+    D_hat = _normalize_list(D_list)
+    S_hat = _normalize_list(S_list)
+    H_hat = _normalize_list(H_list)
+
+    weights = (0.7 * D_hat + 0.3 * S_hat) * (1.0 + 0.5 * H_hat)
+    return weights.tolist()
+
+
+def get_last_conv_names(model, num_layers=4):
+    conv_names = []
+    for name, module in model.named_modules():
+        if isinstance(module, nn.Conv2d):
+            conv_names.append(name)
+    if len(conv_names) <= num_layers:
+        return tuple(conv_names)
+    return tuple(conv_names[-num_layers:])
+
+
+
+
+def ptp_information_aggregation(model, teacher, calib_loader, device,
+                               pruned_out_idx_list,
+                               hook_layers=None,
+                               iters=10, reg=0.02, inc=0.02, lr=1e-3,
+                               use_amp=False):
+    """
+    Stage-1: 剪前信息聚合（IA）
+    1) feature reconstruction
+    2) 对将剪掉通道施加递增L2惩罚
+    """
+    model.train()
+    teacher.eval()
+
+    if hook_layers is None:
+        hook_layers = _infer_ptp_hook_layers(model, num_layers=2)
+    print('IA hook layers:', hook_layers)
+
+    s_feats, s_handles = _register_feature_hooks(model, hook_layers)
+    t_feats, t_handles = _register_feature_hooks(teacher, hook_layers)
+
+    opt = torch.optim.Adam(model.parameters(), lr=lr)
+
+    step = 0
+    for (x, y) in calib_loader:
+        x = x.to(device).float()
+
+        # teacher forward
+        with torch.no_grad():
+            _ = teacher(x)
+            t_feature_list = []
+            for name in hook_layers:
+                t_feature_list.append(_gap_time(t_feats[name]).detach())
+            sj_func.reset_net(teacher)
+
+        # student forward
+        if use_amp:
+            with amp.autocast():
+                _ = model(x)
+                s_feature_list = []
+                for name in hook_layers:
+                    s_feature_list.append(_gap_time(s_feats[name]))
+                sj_func.reset_net(model)
+
+                loss_feat = 0.0
+                for sf, tf in zip(s_feature_list, t_feature_list):
+                    loss_feat = loss_feat + F.mse_loss(sf, tf)
+
+                lam = reg + step * inc
+                loss_reg = _pruned_channel_l2(model, pruned_out_idx_list)
+
+                loss = loss_feat + lam * loss_reg
+        else:
+            _ = model(x)
+            s_feature_list = []
+            for name in hook_layers:
+                s_feature_list.append(_gap_time(s_feats[name]))
+            sj_func.reset_net(model)
+
+            loss_feat = 0.0
+            for sf, tf in zip(s_feature_list, t_feature_list):
+                loss_feat = loss_feat + F.mse_loss(sf, tf)
+
+            lam = reg + step * inc
+            loss_reg = _pruned_channel_l2(model, pruned_out_idx_list)
+
+            loss = loss_feat + lam * loss_reg
+
+        opt.zero_grad(set_to_none=True)
+        loss.backward()
+        opt.step()
+
+        step += 1
+        if step >= iters:
+            break
+
+    for h in s_handles + t_handles:
+        h.remove()
+
+
+def ptp_reconstruction(model, teacher, calib_loader, device,
+                       criterion,
+                       hook_layers=None,
+                       iters=10, lr=1e-3, use_amp=False):
+    """
+    Stage-2: 剪后整体重建（REC）
+    1) 多层 feature reconstruction
+    2) 加少量 CE，防止只贴 teacher 而偏离标签
+    3) layer-wise lr balance
+    """
+    model.train()
+
+    for m in model.modules():
+        if isinstance(m, nn.BatchNorm2d):
+            m.eval()  # 冻结 BN 统计量
+    teacher.eval()
+
+    if hook_layers is None:
+        hook_layers = _infer_ptp_hook_layers(model, num_layers=2)
+    print('REC hook layers:', hook_layers)
+
+    s_feats, s_handles = _register_feature_hooks(model, hook_layers)
+    t_feats, t_handles = _register_feature_hooks(teacher, hook_layers)
+
+    # layer-wise lr balance
+    name_to_module = dict(model.named_modules())
+    param_groups = []
+    L = len(hook_layers)
+
+    for j, name in enumerate(hook_layers, start=1):
+        layer_lr = lr / (L - j + 1)
+        params = list(name_to_module[name].parameters())
+        if len(params) > 0:
+            param_groups.append({
+                "params": params,
+                "lr": layer_lr
+            })
+
+    # classifier / fc 给 base lr
+    for key in ['classifier1', 'classifier2', 'fc']:
+        if key in name_to_module:
+            params = list(name_to_module[key].parameters())
+            if len(params) > 0:
+                param_groups.append({
+                    "params": params,
+                    "lr": lr
+                })
+
+    if len(param_groups) == 0:
+        opt = torch.optim.Adam(model.parameters(), lr=lr)
+    else:
+        opt = torch.optim.Adam(param_groups)
+
+    step = 0
+    for (x, y) in calib_loader:
+        x = x.to(device).float()
+        y = y.to(device)
+
+        # teacher
+        with torch.no_grad():
+            _ = teacher(x)
+            t_feature_list = []
+            for name in hook_layers:
+                t_feature_list.append(_gap_time(t_feats[name]).detach())
+            sj_func.reset_net(teacher)
+
+        # student
+        if use_amp:
+            with amp.autocast():
+                s_logits = model(x)
+                s_feature_list = []
+                for name in hook_layers:
+                    s_feature_list.append(_gap_time(s_feats[name]))
+                sj_func.reset_net(model)
+
+                loss_feat = 0.0
+                for sf, tf in zip(s_feature_list, t_feature_list):
+                    loss_feat = loss_feat + F.mse_loss(sf, tf)
+
+                loss_ce = criterion(s_logits, y)
+                loss = loss_feat + 0.1 * loss_ce
+        else:
+            s_logits = model(x)
+            s_feature_list = []
+            for name in hook_layers:
+                s_feature_list.append(_gap_time(s_feats[name]))
+            sj_func.reset_net(model)
+
+            loss_feat = 0.0
+            for sf, tf in zip(s_feature_list, t_feature_list):
+                loss_feat = loss_feat + F.mse_loss(sf, tf)
+
+            loss_ce = criterion(s_logits, y)
+            loss = loss_feat + 0.1 * loss_ce
+
+        opt.zero_grad(set_to_none=True)
+        loss.backward()
+        opt.step()
+
+        step += 1
+        if step >= iters:
+            break
+
+    for h in s_handles + t_handles:
+        h.remove()
+
+
+
+def adaptive_final_reconstruction(model, teacher, manager, calib_loader, device,
+                                  criterion, iters=20, lr=1e-3,
+                                  lambda_feat=1.0, topk=3, use_amp=False):
+    """
+    训练全部结束后执行一次自适应特征重建：
+    1. 根据动态扰动 + spike rate + 深层先验算权重
+    2. 从最后若干个卷积层中选 top-k 做重建
+    3. 每步优化后重新施加 mask，防止已剪通道复活
+    """
+    model.train()
+    teacher.eval()
+
+    # 冻结 BN running stats，避免小校准集带偏统计
+    for m in model.modules():
+        if isinstance(m, nn.BatchNorm2d):
+            m.eval()
+
+    candidate_layers = get_last_conv_names(model, num_layers=4)
+    print('Adaptive REC candidate layers:', candidate_layers)
+
+    # 先算所有层权重
+    all_layer_weights = compute_adaptive_layer_weights(manager)
+
+    # 构造 conv name -> idx 的映射，顺序要和 do_masks 的 Conv 顺序一致
+    conv_names = []
+    for name, module in model.named_modules():
+        if isinstance(module, nn.Conv2d):
+            conv_names.append(name)
+    conv_name_to_idx = {name: idx for idx, name in enumerate(conv_names)}
+
+    candidate_weight_dict = {}
+    for name in candidate_layers:
+        idx = conv_name_to_idx[name]
+        candidate_weight_dict[name] = all_layer_weights[idx]
+
+    # 选 top-k 层
+    sorted_items = sorted(candidate_weight_dict.items(), key=lambda x: x[1], reverse=True)
+    selected_items = sorted_items[:min(topk, len(sorted_items))]
+    selected_layers = tuple([x[0] for x in selected_items])
+    selected_weight_dict = {k: v for k, v in selected_items}
+
+    print('Adaptive REC selected layers:', selected_layers)
+    print('Adaptive REC weights:', selected_weight_dict)
+
+    # 注册 hook
+    s_feats, s_handles = _register_feature_hooks(model, selected_layers)
+    t_feats, t_handles = _register_feature_hooks(teacher, selected_layers)
+
+    opt = torch.optim.Adam(model.parameters(), lr=lr)
+
+    step = 0
+    for x, y in calib_loader:
+        x = x.to(device).float()
+        y = y.to(device)
+
+        with torch.no_grad():
+            _ = teacher(x)
+            t_feature_dict = {}
+            for name in selected_layers:
+                t_feature_dict[name] = _gap_time(t_feats[name]).detach()
+            sj_func.reset_net(teacher)
+
+        if use_amp:
+            with amp.autocast():
+                s_logits = model(x)
+                s_feature_dict = {}
+                for name in selected_layers:
+                    s_feature_dict[name] = _gap_time(s_feats[name])
+                sj_func.reset_net(model)
+
+                loss_feat = 0.0
+                for name in selected_layers:
+                    w = selected_weight_dict[name]
+                    loss_feat = loss_feat + w * F.mse_loss(s_feature_dict[name], t_feature_dict[name])
+
+                loss_ce = criterion(s_logits, y)
+                loss = lambda_feat * loss_feat + 0.1 * loss_ce
+        else:
+            s_logits = model(x)
+            s_feature_dict = {}
+            for name in selected_layers:
+                s_feature_dict[name] = _gap_time(s_feats[name])
+            sj_func.reset_net(model)
+
+            loss_feat = 0.0
+            for name in selected_layers:
+                w = selected_weight_dict[name]
+                loss_feat = loss_feat + w * F.mse_loss(s_feature_dict[name], t_feature_dict[name])
+
+            loss_ce = criterion(s_logits, y)
+            loss = lambda_feat * loss_feat + 0.1 * loss_ce
+
+        opt.zero_grad(set_to_none=True)
+        loss.backward()
+        opt.step()
+
+        # 关键：防止已剪通道复活
+        manager.do_masks(model)
+
+        step += 1
+        if step >= iters:
+            break
+
+    for h in s_handles + t_handles:
+        h.remove()
 
 
 
@@ -64,22 +669,25 @@ def l1_regularization(model, l1_alpha):
         
             module.weight.grad.data.add_(l1_alpha * torch.sign(module.weight.data))
 
-def train_one_epoch(model,manager, criterion, optimizer, data_loader, device, epoch, print_freq, scaler=None):
+'''
+def train_one_epoch(model,manager, criterion, optimizer, data_loader, device, epoch, print_freq, scaler=None, accum_steps=1):
     model.train()
     metric_logger = utils.MetricLogger(delimiter="  ")
     metric_logger.add_meter('lr', utils.SmoothedValue(window_size=1, fmt='{value}'))
     metric_logger.add_meter('img/s', utils.SmoothedValue(window_size=10, fmt='{value}'))
 
     header = 'Epoch: [{}]'.format(epoch)
-    
-        
+
+    accum_steps = max(1, int(accum_steps))
+
+    optimizer.zero_grad(set_to_none=True)
 
     for image, target in tqdm(data_loader):
 
         
 
         start_time = time.time()
-        image, target = image.to(device), target.to(device)
+        image, target = image.to(device).float(), target.to(device)
         # with torch.autograd.detect_anomaly():
         if scaler is not None:
             with amp.autocast():
@@ -89,12 +697,11 @@ def train_one_epoch(model,manager, criterion, optimizer, data_loader, device, ep
 
             output = model(image)
             loss = criterion(output, target)
-            
-            
-          
+
+        loss_to_backprop = loss / accum_steps
         
 
-        optimizer.zero_grad()
+        
 
         if scaler is not None:
             scaler.scale(loss).backward()
@@ -144,7 +751,78 @@ def train_one_epoch(model,manager, criterion, optimizer, data_loader, device, ep
     print(acc1_s)
     return metric_logger.loss.global_avg, metric_logger.acc1.global_avg, metric_logger.acc5.global_avg
 
+'''
+def train_one_epoch(model, manager, criterion, optimizer, data_loader, device, epoch, print_freq,
+                    scaler=None, accum_steps=1):
 
+    model.train()
+    metric_logger = utils.MetricLogger(delimiter="  ")
+    metric_logger.add_meter('lr', utils.SmoothedValue(window_size=1, fmt='{value}'))
+    metric_logger.add_meter('img/s', utils.SmoothedValue(window_size=10, fmt='{value}'))
+
+    accum_steps = max(1, accum_steps)
+    optimizer.zero_grad(set_to_none=True)
+
+    for step, (image, target) in enumerate(tqdm(data_loader), start=1):
+
+        start_time = time.time()
+        image, target = image.to(device).float(), target.to(device)
+
+        if scaler is not None:
+            with amp.autocast():
+                output = model(image)
+                loss = criterion(output, target)
+        else:
+            output = model(image)
+            loss = criterion(output, target)
+
+        # 关键：缩放 loss
+        loss_to_backward = loss / accum_steps
+
+        if scaler is not None:
+            scaler.scale(loss_to_backward).backward()
+        else:
+            loss_to_backward.backward()
+
+        # 每 accum_steps 次更新一次
+        if step % accum_steps == 0:
+            if scaler is not None:
+                scaler.step(optimizer)
+                scaler.update()
+            else:
+                l1_regularization(model, l1_lambda)
+                optimizer.step()
+
+            optimizer.zero_grad(set_to_none=True)
+
+        functional.reset_net(model)
+
+        # ===== logging =====
+        acc1, acc5 = utils.accuracy(output, target, topk=(1, 5))
+        batch_size = image.shape[0]
+
+        loss_s = loss.item()
+        if math.isnan(loss_s):
+            raise ValueError('loss is Nan')
+
+        metric_logger.update(loss=loss_s, lr=optimizer.param_groups[0]["lr"])
+        metric_logger.meters['acc1'].update(acc1.item(), n=batch_size)
+        metric_logger.meters['acc5'].update(acc5.item(), n=batch_size)
+        metric_logger.meters['img/s'].update(batch_size / (time.time() - start_time))
+
+    # 处理最后剩余梯度
+    if step % accum_steps != 0:
+        if scaler is not None:
+            scaler.step(optimizer)
+            scaler.update()
+        else:
+            l1_regularization(model, l1_lambda)
+            optimizer.step()
+        optimizer.zero_grad(set_to_none=True)
+
+    metric_logger.synchronize_between_processes()
+
+    return metric_logger.loss.global_avg, metric_logger.acc1.global_avg, metric_logger.acc5.global_avg
 
 
 
@@ -155,7 +833,7 @@ def evaluate(model, criterion, data_loader, device, print_freq=100, header='Test
     correct = 0
     with torch.no_grad():
         for image, target in metric_logger.log_every(data_loader, print_freq, header):
-            image = image.to(device, non_blocking=True)
+            image = image.to(device, non_blocking=True).float()
             target = target.to(device, non_blocking=True)
             output = model(image)
             loss = criterion(output, target)
@@ -251,6 +929,9 @@ def main(args):
                           ]))
     
     '''
+    'tiny_imagenet'
+
+    is_dvs = False
 
     if args.dataset == 'cifar10':
         num_classes = 10
@@ -264,55 +945,119 @@ def main(args):
         num_classes = 10
 
         is_dvs = True
+    elif args.dataset == 'tiny_imagenet':
+        num_classes = 200
+        is_dvs = False  # 显式写清楚
+        # Tiny-ImageNet 通常用 ImageNet mean/std
+        mean, std = (0.485, 0.456, 0.406), (0.229, 0.224, 0.225)
     else:
         raise ValueError(f'Unsupported dataset: {args.dataset}')
 
-    train_tf = transforms.Compose([
-        transforms.RandomHorizontalFlip(),
-        transforms.RandomCrop(32, padding=4),
-        transforms.ToTensor(),
-        transforms.Normalize(mean, std),
-    ])
 
-    test_tf = transforms.Compose([
-        transforms.ToTensor(),
-        transforms.Normalize(mean, std),
-    ])
 
-    if is_dvs:
-        from spikingjelly.datasets.dvs_cifar10 import DVS_CIFAR10
 
-        # DVS-CIFAR10 一般不做 torchvision 的 Normalize(mean,std)，而是保持 0/1 或做简单归一
-        tr = DVS_CIFAR10(
-            root='./', train=True, data_type='frame',
-            frames_number=args.frames_number, split_by='number'
-        )
-        te = DVS_CIFAR10(
-            root='./', train=False, data_type='frame',
-            frames_number=args.frames_number, split_by='number'
-        )
 
-        tr = torch.utils.data.DataLoader(tr, batch_size=args.batch_size, shuffle=True, drop_last=True)
-        te = torch.utils.data.DataLoader(te, batch_size=args.batch_size, shuffle=False, drop_last=False)
-    else:
+
+
+    if not is_dvs:
+
+        if args.dataset in ['cifar10', 'cifar100']:
+            train_tf = transforms.Compose([
+                transforms.RandomHorizontalFlip(),
+                transforms.RandomCrop(32, padding=4),
+                transforms.ToTensor(),
+                transforms.Normalize(mean, std),
+            ])
+            test_tf = transforms.Compose([
+                transforms.ToTensor(),
+                transforms.Normalize(mean, std),
+            ])
+
+            tr = Dataset('./', train=True, download=True, transform=train_tf)
+            te = Dataset('./', train=False, download=True, transform=test_tf)
+
+        elif args.dataset == 'tiny_imagenet':
+            train_tf = transforms.Compose([
+                transforms.RandomHorizontalFlip(),
+                transforms.RandomCrop(64, padding=4),
+                transforms.ToTensor(),
+                transforms.Normalize(mean, std),
+            ])
+            test_tf = transforms.Compose([
+                transforms.ToTensor(),
+                transforms.Normalize(mean, std),
+            ])
+
+            train_dir = os.path.join(args.data_path, 'train')
+            val_dir = os.path.join(args.data_path, 'val')
+
+            tr = datasets.ImageFolder(train_dir, transform=train_tf)
+            te = datasets.ImageFolder(val_dir, transform=test_tf)
+
+        else:
+            raise ValueError(f'Unexpected non-DVS dataset: {args.dataset}')
+
+        '''
+        train_tf = transforms.Compose([
+            transforms.RandomHorizontalFlip(),
+            transforms.RandomCrop(32, padding=4),
+            transforms.ToTensor(),
+            transforms.Normalize(mean, std),
+        ])
+
+        test_tf = transforms.Compose([
+            transforms.ToTensor(),
+            transforms.Normalize(mean, std),
+        ])
+
+
         tr = Dataset('./', train=True, download=True, transform=train_tf)
         te = Dataset('./', train=False, download=True, transform=test_tf)
+        '''
+
+    else:
+
+    # DVS-CIFAR10: 使用 SpikingJelly 的 frame 数据
+
+        from spikingjelly.datasets.cifar10_dvs import CIFAR10DVS
+        full = CIFAR10DVS(
+            root='./download/cifar10dvs',
+            data_type='frame',
+            frames_number=args.frames_number,
+            split_by='number'
+        )
+
+        n = len(full)
+        n_train = int(0.9 * n)
+        n_test = n - n_train
+
+        tr, te = random_split(full, [n_train, n_test])
+
+
 
     print(f'dataset_train:{tr.__len__()}, dataset_test:{te.__len__()}')
     train_loader = torch.utils.data.DataLoader(
         tr,
         batch_size=args.batch_size, shuffle=True, drop_last=True)
+    '''
     test_loader = torch.utils.data.DataLoader(
         te,
-        batch_size=args.batch_size, shuffle=True, drop_last=True)
-
-
-
+        batch_size=args.batch_size, shuffle=False, drop_last=True)
+    '''
+    test_loader = torch.utils.data.DataLoader(
+        te,
+        batch_size=args.batch_size, shuffle=False, drop_last=True)
 
     print("Creating model")
-    
-    model=snnvgg16_bn(num_classes=num_classes).to(device)
-    mymanager = PruningNetworkManager(model)
+
+    if args.dataset == 'dvscifar10':
+        model = SNNDVS5Conv(num_classes=10, in_channels=2).to(device)
+    else:
+        model=snnvgg16_bn(num_classes=num_classes).to(device)
+    mymanager = PruningNetworkManager(model, args.output_dir)
+
+    orig_params = count_parameters(model)
+    print(f"Original Params: {orig_params}")
 
     
     print('model')
@@ -325,7 +1070,7 @@ def main(args):
         optimizer = optim.Adam(model.parameters(), lr=args.lr,weight_decay=args.weight_decay)
     else:
         optimizer = optim.SGD(model.parameters(), lr=args.lr,
-              momentum=0.9, weight_decay=args.weight_decay)
+              momentum=args.momentum, weight_decay=args.weight_decay, nesterov=True)
     print('wwww')
     
 
@@ -336,7 +1081,21 @@ def main(args):
         scaler = None
 
     #lr_scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=args.cos_lr_T)
+    '''
     lr_scheduler = StepLR(optimizer, step_size=100, gamma=0.1)
+    '''
+    if args.scheduler == 'cosine':
+        lr_scheduler = CosineAnnealingLR(optimizer, T_max=args.epochs)
+    else:
+        '''
+        lr_scheduler = MultiStepLR(
+            optimizer,
+            milestones=[100, 150],
+            gamma=0.1
+        )
+        '''
+        lr_scheduler = StepLR(optimizer, step_size=100, gamma=0.1)
+
     model_without_ddp = model
     if args.distributed:
         model = torch.nn.parallel.DistributedDataParallel(model, device_ids=[args.gpu])
@@ -345,14 +1104,14 @@ def main(args):
     if args.resume:
         print('a')
         checkpoint = torch.load(args.resume, map_location='cpu')
-        model_without_ddp.load_state_dict(checkpoint['model'])
+        model_without_ddp.load_state_dict(checkpoint['state_dict'])
         optimizer.load_state_dict(checkpoint['optimizer'])
         lr_scheduler.load_state_dict(checkpoint['lr_scheduler'])
 
         args.start_epoch = checkpoint['epoch'] + 1
 
         max_test_acc1 = checkpoint['max_test_acc1']
-        evaluate(model, criterion, data_loader_test, device=device, header='Test:')
+        evaluate(model, criterion, test_loader, device=device, header='Test:')
         return
 
     if args.tb and utils.is_main_process():
@@ -367,7 +1126,7 @@ def main(args):
 
     print("Start training")
     start_time = time.time()
-    writer.flush()
+
     
     for epoch in range(args.epochs):
         print(epoch)
@@ -376,7 +1135,7 @@ def main(args):
             train_sampler.set_epoch(epoch)
         mymanager.training()
         train_loss, train_acc1, train_acc5 = train_one_epoch(model, mymanager,criterion, optimizer, train_loader, device, epoch,
-                                                             args.print_freq, scaler)
+                                                             args.print_freq, scaler,accum_steps=args.accum_steps)
         '''if utils.is_main_process():
             train_tb_writer.add_scalar('train_loss', train_loss, epoch)
             train_tb_writer.add_scalar('train_acc1', train_acc1, epoch)
@@ -388,14 +1147,65 @@ def main(args):
         mymanager.evaling()
 
         test_loss, test_acc1, test_acc5 = evaluate(model, criterion, test_loader, device=device, header='Test:')
-        
-        mymanager.update_masks(model,args.alpha,args.beta) #alpha is the 1-(p+q) in the paper, beta id the q in the paper
-        mymanager.do_masks(model)
-        mymanager.compute_prune()
-       
-        mymanager.save_csv()
-        mymanager.reset_zeros()
-        
+        if epoch >= args.prune_warmup and ((epoch - args.prune_warmup) % args.prune_interval == 0):
+            # if args.ptp:
+            #     # teacher = 当前模型的冻结拷贝（剪枝前）
+            #     teacher = copy.deepcopy(model).to(device)
+            #     teacher.eval()
+            #     for p in teacher.parameters():
+            #         p.requires_grad_(False)
+
+            # 先更新 mask（决定“将剪哪些通道”）
+            mymanager.update_masks(model, args.alpha, args.beta)
+
+            # if args.ptp:
+            #     # 拿到将被剪掉的通道索引（与 do_masks 的 conv 顺序一致）
+            #     pruned_out_idx_list = mymanager.get_pruned_out_idx_list(device=device)
+            #
+            #     # calib 数据：只取 train_loader 的前 N 个 batch
+            #     calib_iter = _make_calib_iter(train_loader, args.ptp_calib_batches)
+            #
+            #     # Stage-1：剪前信息聚合（IA）
+            #
+            #     ptp_information_aggregation(
+            #         model, teacher, calib_iter, device,
+            #         pruned_out_idx_list=pruned_out_idx_list,
+            #         hook_layers=None,
+            #         iters=args.ptp_ia_iters,
+            #         reg=args.ptp_reg,
+            #         inc=args.ptp_inc,
+            #         lr=args.ptp_lr,
+            #         use_amp=args.amp
+            #     )
+
+            # 真正让 mask 生效（剪权重）
+            mymanager.do_masks(model)
+
+            # if args.ptp:
+            #     calib_iter = _make_calib_iter(train_loader, args.ptp_calib_batches)
+            #
+            #     # Stage-2：剪后整体重建（REC）
+            #
+            #     ptp_reconstruction(
+            #         model, teacher, calib_iter, device,
+            #         criterion=criterion,
+            #         hook_layers=None,
+            #         iters=args.ptp_rec_iters,
+            #         lr=args.ptp_lr,
+            #         use_amp=args.amp
+            #     )
+
+            '''
+            mymanager.update_masks(model,args.alpha,args.beta) #alpha is the 1-(p+q) in the paper, beta id the q in the paper
+            mymanager.do_masks(model)
+            '''
+            mymanager.compute_prune()
+
+            mymanager.save_csv()
+            mymanager.reset_zeros()
+        else:
+            print(f"[Warmup] epoch {epoch} < prune_warmup {args.prune_warmup}: skip pruning")
+
         
         
         writer.add_scalar('test_accuracy', test_acc1, epoch )
@@ -410,14 +1220,17 @@ def main(args):
             test_acc5_at_max_test_acc1 = test_acc5
             save_max = True
             best_name = f'vgg16_{args.dataset}_best.pth.tar'
+
+            save_path = os.path.join(args.output_dir, best_name)
             torch.save({
                 'epoch': epoch + 1,
                 'state_dict': model.state_dict(),
                 'best_prec1': max_test_acc1,
                 'optimizer': optimizer.state_dict(),
-            }, os.path.join('./', best_name))
+            }, save_path)
             #print('saved')
-            mymanager.save_csv_max()
+            if epoch >= args.prune_warmup and len(mymanager.masks) > 0:
+                mymanager.save_csv_max()
 
         print(max_test_acc1)
         total_time = time.time() - start_time
@@ -430,10 +1243,130 @@ def main(args):
 
 
 
+    # ===== 训练结束后，执行一次自适应 REC =====
+    if args.adaptive_rec and len(mymanager.masks) > 0:
+        print('\n===== Start adaptive final reconstruction =====')
+
+        teacher = copy.deepcopy(model).to(device)
+        teacher.eval()
+        for p in teacher.parameters():
+            p.requires_grad_(False)
+
+        calib_iter = _make_calib_iter(train_loader, args.ptp_calib_batches)
+
+        adaptive_final_reconstruction(
+            model=model,
+            teacher=teacher,
+            manager=mymanager,
+            calib_loader=calib_iter,
+            device=device,
+            criterion=criterion,
+            iters=args.adaptive_rec_iters,
+            lr=args.ptp_lr,
+            lambda_feat=args.adaptive_rec_lambda,
+            topk=args.adaptive_rec_topk,
+            use_amp=args.amp
+        )
+
+        print('===== Adaptive final reconstruction finished =====')
+
+        final_test_loss, final_test_acc1, final_test_acc5 = evaluate(
+            model, criterion, test_loader, device=device, header='Adaptive-REC Test:'
+        )
+        print('After adaptive reconstruction:', final_test_acc1, final_test_acc5)
+
+    if args.adaptive_rec:
+        adaptive_save_path = os.path.join(args.output_dir, 'adaptive_rec_final.pth.tar')
+        torch.save({
+            'state_dict': model.state_dict(),
+            'acc1': final_test_acc1,
+            'acc5': final_test_acc5,
+        }, adaptive_save_path)
+
+
+
+
+    ###########
+    # ===== 保存最终结构 =====
+    mymanager.save_final_mask()
+    mymanager.save_cfg()
+
+    # ===== 1) Connection =====
+    nonzero_w, total_w, conn_percent = compute_connection_percent(model)
+
+    # ===== 2) Parameters (compact model, from cfg.txt) =====
+    cfg_path = os.path.join(args.output_dir, "cfg.txt")
+    cfg_channels = load_cfg_channels(cfg_path)
+
+    if args.dataset == 'cifar10':
+        num_classes_for_stats = 10
+        input_size_for_stats = 32
+    elif args.dataset == 'cifar100':
+        num_classes_for_stats = 100
+        input_size_for_stats = 32
+    elif args.dataset == 'tiny_imagenet':
+        num_classes_for_stats = 200
+        input_size_for_stats = 64
+    else:
+        # dvscifar10 / others
+        num_classes_for_stats = num_classes
+        input_size_for_stats = 32
+
+    orig_cfg = [64, 64, 128, 128, 256, 256, 256, 512, 512, 512, 512, 512, 512]
+    orig_params = compute_compact_vgg_params(orig_cfg, num_classes=num_classes_for_stats)
+    compact_params = compute_compact_vgg_params(cfg_channels, num_classes=num_classes_for_stats)
+    param_percent = 100.0 * compact_params / orig_params
+
+    # ===== 3) SynOps (approx.) =====
+    spike_rates = collect_layer_spike_rates(mymanager)
+
+    # 如果 spike_rates 数量和 cfg_channels 不一致，先截断到一致
+    n = min(len(spike_rates), len(cfg_channels))
+    spike_rates = spike_rates[:n]
+    cfg_channels_for_syn = cfg_channels[:n]
+    orig_cfg_for_syn = orig_cfg[:n]
+
+    synops_orig = compute_vgg_synops(
+        orig_cfg_for_syn,
+        spike_rates,
+        T=args.T,
+        input_size=input_size_for_stats
+    )
+    synops_compact = compute_vgg_synops(
+        cfg_channels_for_syn,
+        spike_rates,
+        T=args.T,
+        input_size=input_size_for_stats
+    )
+    synops_percent = 100.0 * synops_compact / synops_orig
+
+    print("============== Final Compression Statistics ==============")
+    print(f"Connection (%): {conn_percent:.2f}")
+    print(f"Parameters (%): {param_percent:.2f}")
+    print(f"SynOps (%):     {synops_percent:.2f}")
+
+    stats = {
+        "connection_percent": conn_percent,
+        "parameters_percent": param_percent,
+        "synops_percent": synops_percent,
+        "nonzero_weights": nonzero_w,
+        "total_weights": total_w,
+        "compact_params": compact_params,
+        "orig_params": orig_params
+    }
+
+    df = pd.DataFrame([stats])
+    df.to_csv(os.path.join(args.output_dir, "model_stats.csv"), index=False)
+
+
+
+
+
+
 def parse_args():
     parser = argparse.ArgumentParser(description='PyTorch Classification Training')
 
-    parser.add_argument('--data-path', default='/home/wfang/datasets/ImageNet', help='dataset')
+    parser.add_argument('--data-path', default='./download/tiny-imagenet-200', help='dataset')
 
     parser.add_argument('--model', default='spiking_resnet18', help='model')
     parser.add_argument('--device', default='cuda:1', help='device')
@@ -457,7 +1390,7 @@ def parse_args():
     parser.add_argument('--alpha', default=0.8, type=float)
     parser.add_argument('--beta', default=0.1, type=float)
 
-    parser.add_argument('--dataset', default='cifar10', choices=['cifar10', 'cifar100','dvscifar10'],
+    parser.add_argument('--dataset', default='cifar10', choices=['cifar10', 'cifar100', 'dvscifar10', 'tiny_imagenet'],
                         help='choose dataset: cifar10 or cifar100')
     parser.add_argument('--frames-number', default=20, type=int,
                         help='frames number for DVS-CIFAR10')
@@ -501,6 +1434,39 @@ def parse_args():
                         help='T_max of CosineAnnealingLR.')
     parser.add_argument('--connect_f', default='ADD', type=str, help='spike-element-wise connect function')
     parser.add_argument('--zero_init_residual', action='store_true', help='zero init all residual blocks')
+    parser.add_argument('--accum-steps', default=1, type=int,
+                        help='gradient accumulation steps. effective batch = batch_size * accum_steps')
+
+    parser.add_argument('--ptp', action='store_true',
+                        help='enable two-stage reconstruction (IA + REC) around pruning')
+    parser.add_argument('--ptp-calib-batches', default=10, type=int,
+                        help='num of batches for calibration set each epoch')
+
+
+    parser.add_argument('--ptp-ia-iters', default=10, type=int)
+    parser.add_argument('--ptp-rec-iters', default=10, type=int)
+    parser.add_argument('--ptp-reg', default=0.02, type=float)
+    parser.add_argument('--ptp-inc', default=0.02, type=float)
+    parser.add_argument('--ptp-lr', default=1e-3, type=float)
+
+
+
+
+
+    parser.add_argument('--prune-warmup', default=0, type=int,
+                        help='warmup epochs before pruning starts')
+    parser.add_argument('--prune-interval', default=1, type=int,
+                        help='apply pruning every N epochs after warmup')
+    parser.add_argument('--scheduler', default='step', choices=['step', 'cosine'],
+                        help='lr scheduler: step or cosine')
+
+
+    parser.add_argument('--adaptive-rec', action='store_true',
+                        help='run adaptive reconstruction once after full training')
+    parser.add_argument('--adaptive-rec-iters', default=20, type=int)
+    parser.add_argument('--adaptive-rec-topk', default=3, type=int)
+    parser.add_argument('--adaptive-rec-lambda', default=1.0, type=float)
+
 
     args = parser.parse_args()
     return args
@@ -512,11 +1478,112 @@ if __name__ == "__main__":
 
 '''
 
+tensorboard --logdir=
+
+pip install torch
+ pip install torchvision
+pip install spikingjelly==0.0.0.0.12
+ pip install tensorboardX
+
+无IA
 python m torch.distributed.launch --nproc_per_node=8 --use_env train.py --cos_lr_T 320 --model sew_resnet18 -b 32 --output-dir ./logs --tb --print-freq 4096 --amp --cache-dataset --connect_f ADD --T 4 --lr 0.1 --epoch 320 --data-path /raid/wfang/imagenet
 
 python train.py --cos_lr_T 320 --model spiking_resnet18 -b 32 --output-dir ./logs --tb --print-freq 4096 --amp --cache-dataset --T 4 --lr 0.1 --epoch 320 --data-path /raid/wfang/imagenet --device cuda:0 --zero_init_residual
 
 
-python train.py  --output-dir ./logs --tb  --amp  --T 4 --lr 0.1 --epoch 320  --device cuda:0 --zero_init_residual
+python train.py  --output-dir ./logs --tb  --amp  --T 4 --lr 0.1 --epoch 320  --device cuda:0 --zero_init_residual --amp
+
+#tiny-imagenet
+
+mkdir -p ./download
+cd ./download
+wget http://cs231n.stanford.edu/tiny-imagenet-200.zip
+unzip tiny-imagenet-200.zip
+
+
+nohup python train.py --dataset tiny_imagenet --data-path ./download/tiny-imagenet-200 --batch-size 16 --lr 0.01 --device cuda:0 --output-dir ./tiny_imagenet_trainlog --tb --accum-steps 4 > train_tiny_imagenet.log 2>&1 &
+
+#cifar10dvs
+
+nohup python train.py --dataset dvscifar10 --frames-number 10 --batch-size 4 --accum-steps 16 --lr 0.01 --device cuda:0 --output-dir ./cifar10dvs_trainlog --tb --amp --zero_init_residual > train_dvscifar10dvs.log 2>&1 &
+
+
+有IA
+
+#cifar10
+
+nohup python train.py --dataset cifar10  --batch-size 64  --lr 0.01 --device cuda:0 --output-dir ./cifar10_IA_trainlog --tb --amp --zero_init_residual --ptp --ptp-calib-batches 10 --ptp-ia-iters 20 --ptp-rec-iters 30 --ptp-reg 5e-5 --ptp-inc 5e-5 --ptp-lr 1e-4 > cifar10_IA_train.log 2>&1 &
+
+
+#cifar100
+nohup python train.py --dataset cifar100  --batch-size 64  --lr 0.01 --device cuda:0 --output-dir ./cifar100_IA_log --tb --amp --zero_init_residual --ptp --ptp-calib-batches 10 --ptp-ia-iters 20 --ptp-rec-iters 30 --ptp-reg 5e-5 --ptp-inc 5e-5 --ptp-lr 1e-4 > cifar100_IA_train.log 2>&1 &
+
+nohup python train.py --dataset cifar100  --batch-size 64  --lr 0.01 --device cuda:0 --output-dir ./cifar100_IA_log --tb --amp --zero_init_residual --ptp --ptp-calib-batches 10 --ptp-ia-iters 20 --ptp-rec-iters 30 --ptp-reg 5e-5 --ptp-inc 5e-5 --ptp-lr 1e-4 > cifar100_IA_train.log 2>&1 &
+
+uniquness + gate + 调参
+
+nohup python train.py --adam --scheduler cosine --lr 1e-3 --wd 1e-4 --epochs 200 --prune-warmup 40 --prune-interval 1 --dataset cifar100 --batch-size 64 --device cuda:0 --output-dir ./cifar100_uniqueness_gate_adam_cosine_log --tb --amp --zero_init_residual > cifar100_uniqueness_gate_adam_cosine_train.log 2>&1 &
+
+
+#cifar10dvs
+
+nohup python train.py --dataset dvscifar10 --frames-number 10 --batch-size 4 --accum-steps 16 --lr 0.01 --device cuda:0 --output-dir ./cifar10dvs_IA_trainlog --tb --amp --zero_init_residual --ptp --ptp-calib-batches 10 --ptp-ia-iters 20 --ptp-rec-iters 30 --ptp-reg 5e-5 --ptp-inc 5e-5 --ptp-lr 1e-4 > dvscifar10_IA_train.log 2>&1 &
+
+nohup python train.py  --prune-interval 1 --epochs 200 --prune-warmup 0 --dataset dvscifar10 --frames-number 10 --batch-size 4 --accum-steps 16  --lr 0.01 --device cuda:0 --output-dir ./cifar10dvs_unqueness_gate_regrowth_log --tb --amp --zero_init_residual > cifar10dvs_uniquness_gate_regrowth_train.log 2>&1 &
+
+
+更改评估方法，无IA
+nohup python train.py --prune-interval 5 --epochs 200 --prune-warmup 20 --dataset cifar100  --batch-size 64  --lr 0.01 --device cuda:0 --output-dir ./cifar100_snr_log --tb --amp --zero_init_residual > cifar100_snr_train.log 2>&1 &
+
+uniqueness + gate 无IA
+nohup python train.py  --prune-interval 1 --epochs 150 --prune-warmup 0 --dataset cifar100  --batch-size 64  --lr 0.01 --device cuda:0 --output-dir ./cifar100_unqueness_gate_log --tb --amp --zero_init_residual > cifar100_uniquness_gate_train.log 2>&1 &
+
+uniqueness + gate 有IA
+nohup python train.py  --prune-interval 1 --epochs 200 --prune-warmup 0 --dataset cifar100  --batch-size 64  --lr 0.01 --device cuda:0 --output-dir ./cifar100_unqueness_gate_IA_log --tb --amp --zero_init_residual --ptp --ptp-calib-batches 10 --ptp-ia-iters 20 --ptp-rec-iters 30 --ptp-reg 5e-5 --ptp-inc 5e-5 --ptp-lr 1e-4 > cifar100_uniquness_IA_gate_train.log 2>&1 &
+
+uniqueness + gate + regrowth
+nohup python train.py  --prune-interval 1 --epochs 200 --prune-warmup 0 --dataset cifar100  --batch-size 64  --lr 0.01 --device cuda:0 --output-dir ./cifar100_unqueness_gate_regrowth_log --tb --amp --zero_init_residual > cifar100_uniquness_gate_regrowth_train.log 2>&1 &
+
+uniqueness + gate a60b10 有IA
+nohup python train.py  --prune-interval 1 --epochs 200 --prune-warmup 30 --dataset cifar100  --batch-size 64  --lr 0.01 --device cuda:0 --output-dir ./cifar100_unqueness_gate_IA_a60b10_log --tb --amp --zero_init_residual --ptp --ptp-calib-batches 10 --ptp-ia-iters 20 --ptp-rec-iters 30 --ptp-reg 5e-5 --ptp-inc 5e-5 --ptp-lr 1e-4 > cifar100_uniquness_gate_IA_a60b10_train.log 2>&1 &
+
+
+#tiny-imagenet
+
+
+nohup python train.py --dataset tiny_imagenet --data-path ./download/tiny-imagenet-200 --batch-size 16 --accum-steps 4 --lr 0.01 --device cuda:0 --output-dir ./tiny_imagenet_trainlog --tb --amp --zero_init_residual --ptp --ptp-calib-batches 10 --ptp-ia-iters 20 --ptp-rec-iters 30 --ptp-reg 5e-5 --ptp-inc 5e-5 --ptp-lr 1e-4 > tiny_imagenet_IA_train.log 2>&1 &
+nohup python train.py --dataset tiny_imagenet --data-path ./download/tiny-imagenet-200 --batch-size 16 --accum-steps 4 --lr 0.01 --device cuda:0 --output-dir ./tiny_imagenet_trainlog --tb --amp --zero_init_residual --ptp --ptp-calib-batches 10 --ptp-ia-iters 20 --ptp-rec-iters 30 --ptp-reg 5e-5 --ptp-inc 5e-5 --ptp-lr 1e-4 > tiny_imagenet_IA_train.log 2>&1 &
+
+调整评估方法
+nohup python train.py --dataset tiny_imagenet --data-path ./download/tiny-imagenet-200 --batch-size 16 --accum-steps 4 --lr 0.01 --device cuda:0 --output-dir ./tiny_imagenet_update12_38_4 --tb --amp --zero_init_residual > tiny_imagenet_update12_38_4.log 2>&1 &
+
+nohup python train.py --dataset tiny_imagenet --data-path ./download/tiny-imagenet-200 --batch-size 16 --accum-steps 4 --lr 0.01 --device cuda:0 --output-dir ./tiny_imagenet_update12_IA_38_4 --epochs 200 --tb --amp --zero_init_residual --ptp --ptp-calib-batches 10 --ptp-ia-iters 20 --ptp-rec-iters 30 --ptp-reg 5e-5 --ptp-inc 5e-5 --ptp-lr 1e-4 > tiny_imagenet_update12_38_4.log 2>&1 &
+
+
+
+nohup python train.py --prune-interval 1 --epochs 200 --prune-warmup 0 --dataset tiny_imagenet --data-path ./download/tiny-imagenet-200 --batch-size 16 --accum-steps 4 --lr 0.01 --device cuda:0 --output-dir ./tiny_imagenet_trainlog --tb --amp --zero_init_residual --ptp --ptp-calib-batches 10 --ptp-ia-iters 20 --ptp-rec-iters 30 --ptp-reg 5e-5 --ptp-inc 5e-5 --ptp-lr 1e-4 > tiny_imagenet_IA_train.log 2>&1 &
+
+# uniqueness+gate+regrowth
+nohup python train.py --prune-interval 1 --epochs 200 --prune-warmup 0 --dataset tiny_imagenet --data-path ./download/tiny-imagenet-200 --batch-size 16 --accum-steps 4 --lr 0.01 --device cuda:0 --output-dir ./tiny_imagenet_uniqueness_gate_regrowth_trainlog --tb --amp --zero_init_residual  > tiny_imagenet_uniqueness_gate_regrowth_train.log 2>&1 &
+
+
+更改剪枝率
+#cifar100 0.6 0.1 无IA
+nohup python train.py --dataset cifar100  --batch-size 64  --lr 0.01 --device cuda:0 --output-dir ./cifar100_a60b10_log --tb --amp --zero_init_residual > cifar100_a60b10_train.log 2>&1 &
+#cifar100 0.6 0.1 IA
+nohup python train.py --dataset cifar100  --batch-size 64  --lr 0.01 --device cuda:0 --output-dir ./cifar100_uniquneness_gate_a60b10_IA_log --tb --amp --zero_init_residual --ptp --ptp-calib-batches 10 --ptp-ia-iters 20 --ptp-rec-iters 30 --ptp-reg 5e-5 --ptp-inc 5e-5 --ptp-lr 1e-4 --alpha 0.6 > cifar100_a60b10_IA_train.log 2>&1 &
+
+#调整评估方法 3.8
+nohup python train.py --dataset cifar100  --batch-size 64  --lr 0.01 --device cuda:0 --output-dir ./cifar100_update38 --tb --amp --zero_init_residual > cifar100_update38.log 2>&1 &
+
+
+
+nohup python train.py --dataset cifar100 --adam --scheduler cosine --lr 1e-3 --wd 1e-4 --batch-size 64  --lr 0.01 --device cuda:0 --output-dir ./cifar100_update38_cosine --tb --amp --zero_init_residual > cifar100_update38_cosine.log 2>&1 &
+
+
+nohup python train.py --dataset cifar100 --adam --scheduler cosine --lr 1e-3 --wd 1e-4 --batch-size 64  --lr 0.01 --device cuda:0 --output-dir ./cifar100_update38_cosine --tb --amp --zero_init_residual > cifar100_update38_cosine.log 2>&1 &
+
+nohup python train.py  --dataset cifar100 -b 64 --output-dir ./cifar100_origin_39 --tb --print-freq 4096 --amp --cache-dataset --T 4 --lr 0.1 --epoch  200 --alpha 1.0 --beta 0 --device cuda:0 --zero_init_residual   > cifar100_origin_39.log 2>&1 &
+
 
 '''

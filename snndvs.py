@@ -1,129 +1,101 @@
-
-from mask_manage import PruningLayer
-import math
 import torch
 import torch.nn as nn
-import torch.nn.init as init
-from spikingjelly.clock_driven import functional, surrogate, layer, neuron
-from typing import Callable, overload
-
-import torch
-import torch.nn as nn
-from spikingjelly.clock_driven import layer, neuron
-
+from spikingjelly.clock_driven import layer
 from mask_manage import PruningLayer
-from snnvgg import myMultiStepIFNode  # 复用你已有的 IF 多步节点
+from snnvgg import myMultiStepIFNode
 
 
 class SNNDVS5Conv(nn.Module):
     """
-    Paper-style: 64C3-AP2-128C3-AP2-128C3-AP2-256C3-AP2-256C3-AP2-10FC
-    Compatible with your SCA pruning pipeline (PruningLayer + myMultiStepIFNode).
+    论文 DVS-CIFAR10 backbone:
+    64C3-AP2-128C3-AP2-128C3-AP2-256C3-AP2-256C3-AP2-10FC
     """
 
-    def __init__(self, num_classes=10, in_channels=2, T=10):
+    def __init__(self, num_classes=10, in_channels=2):
         super().__init__()
-        self.T = int(T)
 
-        # ---- block 1: in -> 64 ----
-        self.layer1 = layer.SeqToANNContainer(
-            nn.Conv2d(in_channels, 64, kernel_size=3, padding=1, bias=False),
-            nn.BatchNorm2d(64),
-        )
-        self.neuron1 = myMultiStepIFNode(detach_reset=True)
-        self.prune1 = PruningLayer(layer_id=0,)
-        self.pool1 = layer.SeqToANNContainer(nn.AvgPool2d(kernel_size=2, stride=2))
+        def conv_bn(out_c_in, out_c_out):
+            return layer.SeqToANNContainer(
+                nn.Conv2d(out_c_in, out_c_out, kernel_size=3, padding=1, bias=False),
+                nn.BatchNorm2d(out_c_out),
+            )
 
-        # ---- block 2: 64 -> 128 ----
-        self.layer2 = layer.SeqToANNContainer(
-            nn.Conv2d(64, 128, kernel_size=3, padding=1, bias=False),
-            nn.BatchNorm2d(128),
-        )
-        self.neuron2 = myMultiStepIFNode(detach_reset=True)
-        self.prune2 = PruningLayer(layer_id=1)
-        self.pool2 = layer.SeqToANNContainer(nn.AvgPool2d(kernel_size=2, stride=2))
+        def ap2():
+            return layer.SeqToANNContainer(nn.AvgPool2d(2, 2))
 
-        # ---- block 3: 128 -> 128 ----
-        self.layer3 = layer.SeqToANNContainer(
-            nn.Conv2d(128, 128, kernel_size=3, padding=1, bias=False),
-            nn.BatchNorm2d(128),
-        )
-        self.neuron3 = myMultiStepIFNode(detach_reset=True)
-        self.prune3 = PruningLayer(layer_id=2)
-        self.pool3 = layer.SeqToANNContainer(nn.AvgPool2d(kernel_size=2, stride=2))
+        self.conv1 = conv_bn(in_channels, 64)
+        self.sn1 = myMultiStepIFNode(detach_reset=True)
+        self.pr1 = PruningLayer(layer_id=0)
+        self.pool1 = ap2()
 
-        # ---- block 4: 128 -> 256 ----
-        self.layer4 = layer.SeqToANNContainer(
-            nn.Conv2d(128, 256, kernel_size=3, padding=1, bias=False),
-            nn.BatchNorm2d(256),
-        )
-        self.neuron4 = myMultiStepIFNode(detach_reset=True)
-        self.prune4 = PruningLayer(layer_id=3)
-        self.pool4 = layer.SeqToANNContainer(nn.AvgPool2d(kernel_size=2, stride=2))
+        self.conv2 = conv_bn(64, 128)
+        self.sn2 = myMultiStepIFNode(detach_reset=True)
+        self.pr2 = PruningLayer(layer_id=1)
+        self.pool2 = ap2()
 
-        # ---- block 5: 256 -> 256 ----
-        self.layer5 = layer.SeqToANNContainer(
-            nn.Conv2d(256, 256, kernel_size=3, padding=1, bias=False),
-            nn.BatchNorm2d(256),
-        )
-        self.neuron5 = myMultiStepIFNode(detach_reset=True)
-        self.prune5 = PruningLayer(layer_id=4)
-        self.pool5 = layer.SeqToANNContainer(nn.AvgPool2d(kernel_size=2, stride=2))
+        self.conv3 = conv_bn(128, 128)
+        self.sn3 = myMultiStepIFNode(detach_reset=True)
+        self.pr3 = PruningLayer(layer_id=2)
+        self.pool3 = ap2()
 
-        # classifier (time-major)
+        self.conv4 = conv_bn(128, 256)
+        self.sn4 = myMultiStepIFNode(detach_reset=True)
+        self.pr4 = PruningLayer(layer_id=3)
+        self.pool4 = ap2()
+
+        self.conv5 = conv_bn(256, 256)
+        self.sn5 = myMultiStepIFNode(detach_reset=True)
+        self.pr5 = PruningLayer(layer_id=4)
+        self.pool5 = ap2()
+        self.gap = layer.SeqToANNContainer(nn.AdaptiveAvgPool2d((1, 1)))
+
         self.fc = nn.Linear(256, num_classes)
 
-        # 用于让 manager 动态设置 total_layers（也支持你不改 manager 时手动设）
+        # 给 manager 用（可选）
         self._sca_total_layers = 5
 
     def forward(self, x):
         """
-        x can be:
-          - [B, C, H, W]         (static) -> repeat to [T,B,C,H,W]
-          - [T, B, C, H, W]      (time-major)
-          - [B, T, C, H, W]      (batch-major) -> permute to time-major
+        DVS batch 通常是 [B, T, C, H, W]
+        你的 SeqToANNContainer 期望 [T, B, C, H, W]
         """
-        if x.dim() == 4:
-            x = x.unsqueeze(0).repeat(self.T, 1, 1, 1, 1)
-        elif x.dim() == 5:
-            # try to normalize to [T,B,C,H,W]
-            if x.shape[0] == self.T:
-                pass
-            elif x.shape[1] == self.T:
-                x = x.permute(1, 0, 2, 3, 4).contiguous()
-            else:
-                # 允许数据集给的 T != self.T：按输入的 T 走
-                # 默认认为第一维是 T（更常见）
-                pass
+        if x.dim() == 5:
+            # [B,T,C,H,W] -> [T,B,C,H,W]
+            x = x.permute(1, 0, 2, 3, 4).contiguous()
+        elif x.dim() == 4:
+            # 如果你喂的是静态图，复用原逻辑：repeat 成 T=4（不建议用于 DVS）
+            x = x.unsqueeze(0).repeat(10, 1, 1, 1, 1)
         else:
             raise ValueError(f'Unexpected input shape: {tuple(x.shape)}')
 
-        out = self.layer1(x)
-        out, v1 = self.neuron1(out)
-        out = self.prune1(out, v1.detach())
+        out = self.conv1(x)
+        out, v = self.sn1(out)
+        out = self.pr1(out, v.detach())
         out = self.pool1(out)
 
-        out = self.layer2(out)
-        out, v2 = self.neuron2(out)
-        out = self.prune2(out, v2.detach())
+        out = self.conv2(out)
+        out, v = self.sn2(out)
+        out = self.pr2(out, v.detach())
         out = self.pool2(out)
 
-        out = self.layer3(out)
-        out, v3 = self.neuron3(out)
-        out = self.prune3(out, v3.detach())
+        out = self.conv3(out)
+        out, v = self.sn3(out)
+        out = self.pr3(out, v.detach())
         out = self.pool3(out)
 
-        out = self.layer4(out)
-        out, v4 = self.neuron4(out)
-        out = self.prune4(out, v4.detach())
+        out = self.conv4(out)
+        out, v = self.sn4(out)
+        out = self.pr4(out, v.detach())
         out = self.pool4(out)
 
-        out = self.layer5(out)
-        out, v5 = self.neuron5(out)
-        out = self.prune5(out, v5.detach())
+        out = self.conv5(out)
+        out, v = self.sn5(out)
+        out = self.pr5(out, v.detach())
         out = self.pool5(out)
 
-        # [T,B,256,1,1] -> flatten spatial -> [T,B,256]
+        out = self.gap(out)
+
+        # [T,B,256,1,1] -> [T,B,256]
         out = torch.flatten(out, 2)
-        logits = self.fc(out.mean(dim=0))  # [B,num_classes]
+        logits = self.fc(out.mean(dim=0))  # [B,10]
         return logits
