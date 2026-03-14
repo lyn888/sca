@@ -67,6 +67,43 @@ from spikingjelly.clock_driven import functional as sj_func
 
 
 
+def collect_layer_spike_rates(manager):
+    """
+    从 PruningLayer 中取每层平均 spike rate
+    返回长度 = conv层数 的列表
+    """
+    spike_rates = []
+
+    for pl in manager.pruning_layers:
+        sr = pl.get_spike_rate()
+        if sr is None:
+            spike_rates.append(1.0)
+        else:
+            spike_rates.append(float(sr.mean().item()))
+
+    return spike_rates
+
+
+
+def reset_pruning_layer_stats(manager):
+    for pl in manager.pruning_layers:
+        pl.reset_zero()
+
+@torch.no_grad()
+def calibrate_spike_rates(model, manager, data_loader, device, num_batches=10):
+    model.eval()
+    reset_pruning_layer_stats(manager)
+
+    for i, (images, _) in enumerate(data_loader):
+        if i >= num_batches:
+            break
+        images = images.to(device).float()
+        _ = model(images)
+        functional.reset_net(model)
+
+    spike_rates = collect_layer_spike_rates(manager)
+    return spike_rates
+
 def load_teacher_model(teacher_path, device, num_classes, args):
     """
     从 checkpoint 加载 teacher 模型
